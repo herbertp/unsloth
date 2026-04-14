@@ -146,7 +146,13 @@ class LlamaCppBackend:
 
     @property
     def base_url(self) -> str:
-        return f"http://127.0.0.1:{self._port}"
+        import os as _os
+
+        host = _os.environ.get("UNSLOTH_LLAMA_CPP_HOST", "0.0.0.0")
+        # If binding to 0.0.0.0, use 127.0.0.1 for local health checks and proxying
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        return f"http://{host}:{self._port}"
 
     @property
     def model_identifier(self) -> Optional[str]:
@@ -635,10 +641,30 @@ class LlamaCppBackend:
     # ── Port allocation ───────────────────────────────────────────
 
     @staticmethod
-    def _find_free_port() -> int:
-        """Find an available TCP port."""
+    def _find_free_port(
+        host: str = "0.0.0.0",
+        min_port: Optional[int] = None,
+        max_port: Optional[int] = None,
+    ) -> int:
+        """Find an available TCP port.
+
+        If min_port and max_port are provided, searches within that range.
+        Otherwise, binds to a random free port.
+        """
+        if min_port is not None and max_port is not None:
+            for port in range(min_port, max_port + 1):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    try:
+                        s.bind((host, port))
+                        return port
+                    except OSError:
+                        continue
+            raise RuntimeError(
+                f"Could not find a free port in range {min_port}-{max_port} on {host}"
+            )
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
+            s.bind((host, 0))
             return s.getsockname()[1]
 
     # ── Stdout drain (prevents pipe deadlock on Windows) ─────────
@@ -1129,7 +1155,16 @@ class LlamaCppBackend:
                 logger.info("Load cancelled before server start")
                 return False
 
-            self._port = self._find_free_port()
+            import os as _os
+
+            host = _os.environ.get("UNSLOTH_LLAMA_CPP_HOST", "0.0.0.0")
+            try:
+                p_min = int(_os.environ.get("UNSLOTH_LLAMA_CPP_PORT_MIN", "9990"))
+                p_max = int(_os.environ.get("UNSLOTH_LLAMA_CPP_PORT_MAX", "9999"))
+            except ValueError:
+                p_min, p_max = 9990, 9999
+
+            self._port = self._find_free_port(host = host, min_port = p_min, max_port = p_max)
 
             # Select GPU(s) based on model size + estimated KV cache.
             # Seed safe defaults before GPU probing so the except path
@@ -1275,10 +1310,20 @@ class LlamaCppBackend:
                 gpu_indices, use_fit = None, True
                 effective_ctx = n_ctx  # fall back to original
 
+            # Allow environment variable to override n_parallel
+            try:
+                env_parallel = _os.environ.get("UNSLOTH_LLAMA_CPP_PARALLEL")
+                if env_parallel is not None:
+                    n_parallel = int(env_parallel)
+            except ValueError:
+                pass
+
             cmd = [
                 binary,
                 "-m",
                 model_path,
+                "--host",
+                host,
                 "--port",
                 str(self._port),
                 "-c",
@@ -1288,6 +1333,9 @@ class LlamaCppBackend:
                 "--flash-attn",
                 "on",  # Force flash attention for speed
             ]
+
+            if n_parallel > 1:
+                cmd.extend(["--cont-batching"])
 
             if use_fit:
                 cmd.extend(["--fit", "on"])
@@ -1408,15 +1456,26 @@ class LlamaCppBackend:
                     logger.info(f"Using mmproj for vision: {mmproj_path}")
 
             # Option C: add --api-key for direct client access when enabled
-            import os as _os
             import secrets as _secrets
 
-            if _os.getenv("UNSLOTH_DIRECT_STREAM", "0") == "1":
+            env_api_key = _os.environ.get("UNSLOTH_LLAMA_CPP_API_KEY")
+            if env_api_key:
+                self._api_key = env_api_key
+                cmd.extend(["--api-key", self._api_key])
+                logger.info("llama-server started with UNSLOTH_LLAMA_CPP_API_KEY")
+            elif _os.getenv("UNSLOTH_DIRECT_STREAM", "0") == "1":
                 self._api_key = _secrets.token_urlsafe(32)
                 cmd.extend(["--api-key", self._api_key])
                 logger.info("llama-server started with --api-key for direct streaming")
             else:
                 self._api_key = None
+
+            # Add arbitrary options from UNSLOTH_LLAMA_CPP_OPTIONS
+            extra_options = _os.environ.get("UNSLOTH_LLAMA_CPP_OPTIONS")
+            if extra_options:
+                import shlex
+
+                cmd.extend(shlex.split(extra_options))
 
             _log_cmd = list(cmd)
             if "--api-key" in _log_cmd:
@@ -1822,7 +1881,7 @@ class LlamaCppBackend:
         Also monitors subprocess for early exit/crash.
         """
         deadline = time.monotonic() + timeout
-        url = f"http://127.0.0.1:{self._port}/health"
+        url = f"{self.base_url}/health"
 
         while time.monotonic() < deadline:
             # Check if process crashed
