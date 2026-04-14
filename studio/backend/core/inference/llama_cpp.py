@@ -130,7 +130,9 @@ class LlamaCppBackend:
         self._cancel_event = threading.Event()
         self._api_key: Optional[str] = None
 
-        self._kill_orphaned_servers()
+        import os as _os
+        if _os.environ.get("UNSLOTH_LLAMA_CPP_KEEP_ORPHANS", "0") != "1":
+            self._kill_orphaned_servers()
         atexit.register(self._cleanup)
 
     # ── Properties ────────────────────────────────────────────────
@@ -146,7 +148,13 @@ class LlamaCppBackend:
 
     @property
     def base_url(self) -> str:
-        return f"http://127.0.0.1:{self._port}"
+        import os as _os
+
+        host = _os.environ.get("UNSLOTH_LLAMA_CPP_HOST", "0.0.0.0")
+        # If binding to 0.0.0.0, use 127.0.0.1 for local health checks and proxying
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        return f"http://{host}:{self._port}"
 
     @property
     def model_identifier(self) -> Optional[str]:
@@ -167,113 +175,13 @@ class LlamaCppBackend:
 
     @property
     def max_context_length(self) -> Optional[int]:
-        """Return the largest context that fits on this hardware at load time.
-
-        This is the "safe zone" threshold the UI renders warnings
-        against. For a model whose weights fit on some GPU subset, it
-        is the binary-search cap from ``_fit_context_to_vram`` for that
-        subset. For a model whose weights exceed 90% of every GPU
-        subset, it is the 4096 fallback -- the spec's default when the
-        model will not fit. The UI slider ceiling is
-        ``native_context_length``; dragging above ``max_context_length``
-        triggers the "might be slower" warning.
-        """
+        """Return the maximum context currently available on this hardware."""
         return self._max_context_length or self._context_length
 
     @property
     def native_context_length(self) -> Optional[int]:
         """Return the model's native context length from GGUF metadata."""
         return self._context_length
-
-    def load_progress(self) -> Optional[dict]:
-        """Return live model-load progress, or None if not loading.
-
-        While llama-server is warming up, its process is typically in
-        kernel state D (disk sleep) mmap'ing the weight shards into
-        page cache before pushing layers to VRAM. During that window
-        ``/api/inference/status`` only reports ``loading``, which gives
-        the UI nothing to display besides a spinner that looks stuck
-        for minutes on large MoE models.
-
-        This method samples ``/proc/<pid>/status VmRSS`` against the
-        sum of the GGUF shard sizes so the UI can render a real bar
-        and compute rate / ETA. Returns ``None`` when no load is in
-        flight (no process, or process already healthy).
-
-        Shape::
-
-            {
-                "phase": "mmap" | "ready",
-                "bytes_loaded": int,   # VmRSS of the llama-server
-                "bytes_total":  int,   # sum of shard file sizes
-                "fraction": float,     # bytes_loaded / bytes_total, 0..1
-            }
-
-        Linux-only in the current implementation. On macOS/Windows the
-        equivalent would be a different API; this returns ``None`` on
-        platforms where ``/proc/<pid>/status`` is unavailable.
-        """
-        proc = self._process
-        if proc is None:
-            return None
-        pid = proc.pid
-        if pid is None:
-            return None
-
-        # Sum up shard sizes (primary + any extras sitting alongside).
-        bytes_total = 0
-        gguf_path = self._gguf_path
-        if gguf_path:
-            primary = Path(gguf_path)
-            try:
-                if primary.is_file():
-                    bytes_total += primary.stat().st_size
-            except OSError:
-                pass
-            # Extra shards live alongside the primary with the same prefix
-            # before the shard index (e.g. ``-00001-of-00004.gguf``).
-            try:
-                parent = primary.parent
-                stem = primary.name
-                m = _SHARD_RE.match(stem)
-                prefix = m.group(1) if m else None
-                if prefix and parent.is_dir():
-                    for sibling in parent.iterdir():
-                        if (
-                            sibling.is_file()
-                            and sibling.name.startswith(prefix)
-                            and sibling.name != stem
-                            and sibling.suffix == ".gguf"
-                        ):
-                            try:
-                                bytes_total += sibling.stat().st_size
-                            except OSError:
-                                pass
-            except OSError:
-                pass
-
-        # Read VmRSS from /proc/<pid>/status. Kilobytes on Linux.
-        bytes_loaded = 0
-        try:
-            with open(f"/proc/{pid}/status", "r", encoding = "utf-8") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        kb = int(line.split()[1])
-                        bytes_loaded = kb * 1024
-                        break
-        except (FileNotFoundError, PermissionError, ValueError, OSError):
-            return None
-
-        phase = "ready" if self._healthy else "mmap"
-        fraction = 0.0
-        if bytes_total > 0:
-            fraction = min(1.0, bytes_loaded / bytes_total)
-        return {
-            "phase": phase,
-            "bytes_loaded": bytes_loaded,
-            "bytes_total": bytes_total,
-            "fraction": round(fraction, 4),
-        }
 
     @property
     def chat_template(self) -> Optional[str]:
@@ -735,10 +643,30 @@ class LlamaCppBackend:
     # ── Port allocation ───────────────────────────────────────────
 
     @staticmethod
-    def _find_free_port() -> int:
-        """Find an available TCP port."""
+    def _find_free_port(
+        host: str = "0.0.0.0",
+        min_port: Optional[int] = None,
+        max_port: Optional[int] = None,
+    ) -> int:
+        """Find an available TCP port.
+
+        If min_port and max_port are provided, searches within that range.
+        Otherwise, binds to a random free port.
+        """
+        if min_port is not None and max_port is not None:
+            for port in range(min_port, max_port + 1):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    try:
+                        s.bind((host, port))
+                        return port
+                    except OSError:
+                        continue
+            raise RuntimeError(
+                f"Could not find a free port in range {min_port}-{max_port} on {host}"
+            )
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
+            s.bind((host, 0))
             return s.getsockname()[1]
 
     # ── Stdout drain (prevents pipe deadlock on Windows) ─────────
@@ -1004,34 +932,10 @@ class LlamaCppBackend:
         try:
             import os
 
-            from huggingface_hub import get_paths_info, try_to_load_from_cache
+            from huggingface_hub import get_paths_info
 
             path_infos = list(get_paths_info(hf_repo, all_gguf_files, token = hf_token))
-            total_bytes = sum((p.size or 0) for p in path_infos)
-
-            # Subtract bytes already present in the HF cache so we only
-            # preflight against what we actually have to download. Without
-            # this, re-loading a cached large model (e.g. MiniMax-M2.7-GGUF
-            # at 131 GB) fails cold whenever free disk is below the full
-            # weight footprint, even though nothing needs downloading.
-            already_cached_bytes = 0
-            for p in path_infos:
-                if not p.size:
-                    continue
-                try:
-                    cached_path = try_to_load_from_cache(hf_repo, p.path)
-                except Exception:
-                    cached_path = None
-                if isinstance(cached_path, str) and os.path.exists(cached_path):
-                    try:
-                        on_disk = os.path.getsize(cached_path)
-                    except OSError:
-                        on_disk = 0
-                    # Count as satisfied only when the full blob is present.
-                    if on_disk >= p.size:
-                        already_cached_bytes += p.size
-
-            total_download_bytes = max(0, total_bytes - already_cached_bytes)
+            total_download_bytes = sum((p.size or 0) for p in path_infos)
 
             if total_download_bytes > 0:
                 cache_dir = os.environ.get(
@@ -1043,11 +947,9 @@ class LlamaCppBackend:
 
                 total_gb = total_download_bytes / (1024**3)
                 free_gb = free_bytes / (1024**3)
-                cached_gb = already_cached_bytes / (1024**3)
 
                 logger.info(
-                    f"GGUF download: {total_gb:.1f} GB needed "
-                    f"({cached_gb:.1f} GB already cached), "
+                    f"GGUF download: {total_gb:.1f} GB needed, "
                     f"{free_gb:.1f} GB free on disk"
                 )
 
@@ -1255,7 +1157,16 @@ class LlamaCppBackend:
                 logger.info("Load cancelled before server start")
                 return False
 
-            self._port = self._find_free_port()
+            import os as _os
+
+            host = _os.environ.get("UNSLOTH_LLAMA_CPP_HOST", "0.0.0.0")
+            try:
+                p_min = int(_os.environ.get("UNSLOTH_LLAMA_CPP_PORT_MIN", "9990"))
+                p_max = int(_os.environ.get("UNSLOTH_LLAMA_CPP_PORT_MAX", "9999"))
+            except ValueError:
+                p_min, p_max = 9990, 9999
+
+            self._port = self._find_free_port(host = host, min_port = p_min, max_port = p_max)
 
             # Select GPU(s) based on model size + estimated KV cache.
             # Seed safe defaults before GPU probing so the except path
@@ -1319,28 +1230,36 @@ class LlamaCppBackend:
                                 best_cap = max(best_cap, capped)
                         if best_cap > 0:
                             max_available_ctx = best_cap
-                        else:
-                            # Weights exceed 90% of every GPU subset's free
-                            # memory, so there is no fitting context. Anchor
-                            # the UI's "safe zone" threshold at 4096 (the
-                            # spec's default when the model cannot fit) so
-                            # the ctx slider shows the "might be slower"
-                            # warning as soon as the user drags above the
-                            # fallback default instead of never.
-                            max_available_ctx = min(4096, native_ctx_for_cap)
 
                     if explicit_ctx:
-                        # Honor the user's requested context verbatim. If it
-                        # fits, pin GPUs and skip --fit; if it doesn't, ship
-                        # -c <user_ctx> --fit on and let llama-server flex
-                        # -ngl (CPU layer offload). The UI is expected to
-                        # have surfaced the "might be slower" warning before
-                        # the user submitted a ctx above the fit ceiling.
+                        # Try to honor the user's requested context exactly.
                         requested_total = model_size + self._estimate_kv_cache_bytes(
                             effective_ctx, cache_type_kv
                         )
                         gpu_indices, use_fit = self._select_gpus(requested_total, gpus)
-                        # No silent shrink: effective_ctx stays == n_ctx.
+
+                        # Full context doesn't fit anywhere -- cap it on the
+                        # best GPU subset we can find (fewest GPUs first).
+                        if use_fit:
+                            ranked = sorted(gpus, key = lambda g: g[1], reverse = True)
+                            for n_gpus in range(1, len(ranked) + 1):
+                                subset = ranked[:n_gpus]
+                                pool_mib = sum(free for _, free in subset)
+                                capped = self._fit_context_to_vram(
+                                    effective_ctx,
+                                    pool_mib,
+                                    model_size,
+                                    cache_type_kv,
+                                )
+                                kv = self._estimate_kv_cache_bytes(
+                                    capped, cache_type_kv
+                                )
+                                total_mib = (model_size + kv) / (1024 * 1024)
+                                if total_mib <= pool_mib * 0.90:
+                                    effective_ctx = capped
+                                    gpu_indices = sorted(idx for idx, _ in subset)
+                                    use_fit = False
+                                    break
                     else:
                         # Auto context: prefer fewer GPUs, cap context to fit.
                         ranked = sorted(gpus, key = lambda g: g[1], reverse = True)
@@ -1360,13 +1279,6 @@ class LlamaCppBackend:
                                 gpu_indices = sorted(idx for idx, _ in subset)
                                 use_fit = False
                                 break
-                        else:
-                            # No subset can host the weights (weights alone
-                            # exceed 90% of every pool). Per spec, default
-                            # the UI-visible context to 4096 and let
-                            # --fit on flex -ngl so llama-server offloads
-                            # layers to CPU RAM.
-                            effective_ctx = min(4096, effective_ctx)
 
                 elif gpus:
                     # Can't estimate KV -- fall back to file-size-only check.
@@ -1377,13 +1289,6 @@ class LlamaCppBackend:
                         model_size_gb = round(model_size / (1024**3), 2),
                     )
                     gpu_indices, use_fit = self._select_gpus(model_size, gpus)
-                    if use_fit and not explicit_ctx:
-                        # Weights don't fit on any subset. Default the UI to
-                        # 4096 so the slider doesn't land on an unusable native
-                        # context. --fit on will flex -ngl at runtime.
-                        effective_ctx = (
-                            min(4096, effective_ctx) if effective_ctx > 0 else 4096
-                        )
 
                 if effective_ctx < original_ctx:
                     kv_est = self._estimate_kv_cache_bytes(effective_ctx, cache_type_kv)
@@ -1407,10 +1312,20 @@ class LlamaCppBackend:
                 gpu_indices, use_fit = None, True
                 effective_ctx = n_ctx  # fall back to original
 
+            # Allow environment variable to override n_parallel
+            try:
+                env_parallel = _os.environ.get("UNSLOTH_LLAMA_CPP_PARALLEL")
+                if env_parallel is not None:
+                    n_parallel = int(env_parallel)
+            except ValueError:
+                pass
+
             cmd = [
                 binary,
                 "-m",
                 model_path,
+                "--host",
+                host,
                 "--port",
                 str(self._port),
                 "-c",
@@ -1420,6 +1335,9 @@ class LlamaCppBackend:
                 "--flash-attn",
                 "on",  # Force flash attention for speed
             ]
+
+            if n_parallel > 1:
+                cmd.extend(["--cont-batching"])
 
             if use_fit:
                 cmd.extend(["--fit", "on"])
@@ -1540,15 +1458,26 @@ class LlamaCppBackend:
                     logger.info(f"Using mmproj for vision: {mmproj_path}")
 
             # Option C: add --api-key for direct client access when enabled
-            import os as _os
             import secrets as _secrets
 
-            if _os.getenv("UNSLOTH_DIRECT_STREAM", "0") == "1":
+            env_api_key = _os.environ.get("UNSLOTH_LLAMA_CPP_API_KEY")
+            if env_api_key:
+                self._api_key = env_api_key
+                cmd.extend(["--api-key", self._api_key])
+                logger.info("llama-server started with UNSLOTH_LLAMA_CPP_API_KEY")
+            elif _os.getenv("UNSLOTH_DIRECT_STREAM", "0") == "1":
                 self._api_key = _secrets.token_urlsafe(32)
                 cmd.extend(["--api-key", self._api_key])
                 logger.info("llama-server started with --api-key for direct streaming")
             else:
                 self._api_key = None
+
+            # Add arbitrary options from UNSLOTH_LLAMA_CPP_OPTIONS
+            extra_options = _os.environ.get("UNSLOTH_LLAMA_CPP_OPTIONS")
+            if extra_options:
+                import shlex
+
+                cmd.extend(shlex.split(extra_options))
 
             _log_cmd = list(cmd)
             if "--api-key" in _log_cmd:
@@ -1664,12 +1593,7 @@ class LlamaCppBackend:
             )
             self._stdout_thread.start()
 
-            # Store the resolved on-disk path, not the caller's kwarg. In
-            # HF mode the caller passes gguf_path=None and the real path
-            # (``model_path``) is what llama-server is actually mmap'ing.
-            # Downstream consumers (load_progress, log lines, etc.) need
-            # the path that exists on disk.
-            self._gguf_path = model_path
+            self._gguf_path = gguf_path
             self._hf_repo = hf_repo
             # For local GGUF files, extract variant from filename if not provided
             if hf_variant:
@@ -1959,7 +1883,7 @@ class LlamaCppBackend:
         Also monitors subprocess for early exit/crash.
         """
         deadline = time.monotonic() + timeout
-        url = f"http://127.0.0.1:{self._port}/health"
+        url = f"{self.base_url}/health"
 
         while time.monotonic() < deadline:
             # Check if process crashed
